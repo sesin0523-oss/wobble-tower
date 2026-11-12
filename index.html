@@ -716,14 +716,28 @@ function makePeerRoomApi() {
           conn.on('error', () => {});
         });
       } else {
-        peer = await openPeer(null);
-        hubConn = await new Promise((res, rej) => {
+        // 방장 화면이 잠깐 꺼졌다 돌아오는 중일 수 있으니 몇 번 다시 시도
+        const tryConnect = () => new Promise((res, rej) => {
           const c = peer.connect(hubId, { reliable: true });
-          const onErr = e => { clearTimeout(t); peer.destroy(); rej({ code: e && e.type === 'peer-unavailable' ? 'not_found' : 'upstream_error' }); };
-          const t = setTimeout(() => { peer.off('error', onErr); peer.destroy(); rej({ code: 'not_found' }); }, 10000);
+          const onErr = e => {
+            if (e && e.type === 'peer-unavailable') { clearTimeout(t); peer.off('error', onErr); rej({ code: 'not_found' }); }
+            else if (e && (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error')) { clearTimeout(t); peer.off('error', onErr); rej({ code: 'upstream_error', detail: e.type }); }
+          };
+          // 서버는 방을 찾았는데 직접 연결이 안 되는 경우 = 네트워크가 막고 있음
+          const t = setTimeout(() => { peer.off('error', onErr); try { c.close(); } catch (e) {} rej({ code: 'no_route' }); }, 15000);
           c.once('open', () => { clearTimeout(t); peer.off('error', onErr); res(c); });
           peer.on('error', onErr);
         });
+        // 시도마다 새 Peer를 써야 '방 없음' 응답을 다시 받을 수 있음
+        for (let attempt = 1; ; attempt++) {
+          peer = await openPeer(null);
+          try { hubConn = await tryConnect(); break; }
+          catch (e) {
+            peer.destroy();
+            if (e.code === 'not_found' && attempt < 4) { setOnMsg(`방을 찾는 중… (${attempt + 1}/4)`); await new Promise(r => setTimeout(r, 2000)); continue; }
+            throw e;
+          }
+        }
         hubConn.on('data', m => {
           if (!m || typeof m !== 'object') return;
           if (m.t === 'all' && Array.isArray(m.list)) {
@@ -738,8 +752,12 @@ function makePeerRoomApi() {
         });
         hubConn.on('close', () => { if (closed) return; others.clear(); notify(); fail('방장이 나가서 방이 닫혔어요.'); });
       }
-      peer.on('disconnected', () => { if (!closed) { try { peer.reconnect(); } catch (e) {} } });
+      // 다른 앱으로 갔다 오면 서버 연결이 끊길 수 있음 → 다시 붙기
+      const revive = () => { if (!closed && peer.disconnected && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} } };
+      peer.on('disconnected', () => setTimeout(revive, 1000));
       peer.on('error', () => {});
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) revive(); });
+      const reviveTimer = setInterval(() => { if (closed) clearInterval(reviveTimer); else revive(); }, 5000);
 
       const flush = () => {
         sendTimer = null; if (closed) return;
@@ -778,8 +796,9 @@ async function joinRoom(code, create) {
     const c = e && e.code;
     if (c === 'taken' && create) { joinRoom(newCode(), true); return; }
     setOnMsg(c === 'not_permitted' ? '이 화면에서는 방에 들어갈 수 없어요. 페이지 주인에게 공유를 요청해 주세요.'
-      : c === 'not_found' ? '방을 찾을 수 없어요. 코드를 확인하거나, 방장이 아직 방에 있는지 확인해 주세요.'
-      : '연결하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.');
+      : c === 'not_found' ? '방을 찾을 수 없어요. ① 코드가 맞는지 ② 방장과 같은 링크로 들어왔는지 ③ 방장이 게임 화면을 켜 두고 있는지 확인해 주세요. (방장이 다른 앱으로 가 있으면 방이 안 보여요)'
+      : c === 'no_route' ? '방은 찾았는데 연결이 안 돼요. 와이파이(학교·회사 등)가 직접 연결을 막고 있을 수 있어요. 휴대폰 데이터나 다른 와이파이로 다시 시도해 보세요.'
+      : '연결하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.' + (e && e.detail ? ` (${e.detail})` : ''));
     return;
   }
   joining = false; roomCode = code; setOnMsg('');
@@ -816,7 +835,9 @@ function renderOnline() {
   const host = isHost();
   if (!host && h && (h.presence.m === 'race' || h.presence.m === 'survival')) mode = h.presence.m;
   document.getElementById('hostStartBtn').hidden = !host;
-  document.getElementById('waitMsg').textContent = host ? '' : '방장이 게임을 시작하길 기다리는 중…';
+  document.getElementById('waitMsg').textContent = host
+    ? '📢 친구가 다 들어올 때까지 이 화면을 켜 두세요. 다른 앱이나 탭으로 가 있으면 친구가 방을 못 찾을 수 있어요.'
+    : '방장이 게임을 시작하길 기다리는 중…';
   refreshModeButtons();
 }
 
